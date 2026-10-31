@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body, canvas {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: transparent;
+  }
+  canvas { display: block; background: transparent; }
+</style>
+<script>
+(function () {
+  // pet.js 只有 centerColor/edgeColor/glowColor 这三个身体色。Three.js 会把
+  // 颜色先转换到线性工作空间再上传；按 uniform 名拦截，避免用 sRGB 调色板猜值。
+  // 默认 211.33 是中心色 #1D89FF，停在这里时完全保留原值。
+  var DEFAULT_HUE = 211.33;
+  var COLOR_UNIFORMS = {
+    centerColor: true,
+    edgeColor: true,
+    glowColor: true,
+    crescentColor: true
+  };
+  var hue = (typeof window.__wcrHue === "number" && isFinite(window.__wcrHue))
+    ? window.__wcrHue : DEFAULT_HUE;
+  var slots = [];
+  var locations = [];
+
+  function rgbToHsl(r, g, b) {
+    var max = Math.max(r, g, b), min = Math.min(r, g, b);
+    var h = 0, s = 0, l = (max + min) / 2, d = max - min;
+    if (d > 1e-5) {
+      s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+      if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+      else if (max === g) h = (b - r) / d + 2;
+      else h = (r - g) / d + 4;
+      h /= 6;
+    }
+    return [h, s, l];
+  }
+  function hslToRgb(h, s, l) {
+    if (s < 1e-5) return [l, l, l];
+    var q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    var p = 2 * l - q;
+    function channel(t) {
+      if (t < 0) t += 1;
+      if (t > 1) t -= 1;
+      if (t < 1 / 6) return p + (q - p) * 6 * t;
+      if (t < 1 / 2) return q;
+      if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+      return p;
+    }
+    return [channel(h + 1 / 3), channel(h), channel(h - 1 / 3)];
+  }
+  function linearToSrgb(c) {
+    return c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+  }
+  function srgbToLinear(c) {
+    return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  }
+  function shifted(r, g, b) {
+    if (Math.abs(hue - DEFAULT_HUE) < 0.75) return [r, g, b];
+    var sr = linearToSrgb(r), sg = linearToSrgb(g), sb = linearToSrgb(b);
+    var hsl = rgbToHsl(sr, sg, sb);
+    var next = ((hue % 360) + 360) % 360 / 360;
+    var rgb = hslToRgb(next, hsl[1], hsl[2]);
+    return [srgbToLinear(rgb[0]), srgbToLinear(rgb[1]), srgbToLinear(rgb[2])];
+  }
+  function findName(loc) {
+    for (var i = 0; i < locations.length; i++) {
+      if (locations[i].loc === loc) return locations[i].name;
+    }
+    return "";
+  }
+  function rememberName(loc, name) {
+    for (var i = 0; i < locations.length; i++) {
+      if (locations[i].loc === loc) {
+        locations[i].name = name;
+        return;
+      }
+    }
+    locations.push({ loc: loc, name: name });
+  }
+  function isColor(loc) {
+    return !!COLOR_UNIFORMS[findName(loc)];
+  }
+  function findSlot(loc) {
+    for (var i = 0; i < slots.length; i++) {
+      if (slots[i].loc === loc) return slots[i];
+    }
+    return null;
+  }
+  function remember(gl, loc, r, g, b) {
+    var program = gl.getParameter(gl.CURRENT_PROGRAM);
+    if (!program) return;
+    var slot = findSlot(loc);
+    if (slot) {
+      slot.program = program;
+      return;
+    }
+    slots.push({ gl: gl, program: program, loc: loc, r: r, g: g, b: b });
+  }
+  function mapped(gl, loc, r, g, b) {
+    if (!loc || !isColor(loc) || !isFinite(r) || !isFinite(g) || !isFinite(b)) return null;
+    if (!findSlot(loc)) remember(gl, loc, r, g, b);
+    return shifted(r, g, b);
+  }
+  function reapply(gl) {
+    var program = gl.getParameter(gl.CURRENT_PROGRAM);
+    if (!program) return;
+    for (var i = 0; i < slots.length; i++) {
+      var slot = slots[i];
+      if (slot.gl !== gl || slot.program !== program || !isColor(slot.loc)) continue;
+      var c = shifted(slot.r, slot.g, slot.b);
+      gl.__wcrOrig3f.call(gl, slot.loc, c[0], c[1], c[2]);
+    }
+  }
+  var proto = HTMLCanvasElement.prototype;
+  var origGet = proto.getContext;
+  proto.getContext = function (type, attrs) {
+    var gl = origGet.call(this, type, attrs);
+    if (!gl || gl.__wcrHueHooked) return gl;
+    if (type !== "webgl" && type !== "webgl2" && type !== "experimental-webgl") return gl;
+    gl.__wcrHueHooked = true;
+    var origGetUniformLocation = gl.getUniformLocation;
+    var orig3f = gl.uniform3f;
+    var orig3fv = gl.uniform3fv;
+    var origDraw = gl.drawArrays;
+    var origDrawEl = gl.drawElements;
+    gl.__wcrOrig3f = orig3f;
+    gl.getUniformLocation = function (program, name) {
+      var loc = origGetUniformLocation.call(gl, program, name);
+      if (loc) rememberName(loc, name);
+      return loc;
+    };
+    gl.uniform3f = function (loc, x, y, z) {
+      var c = mapped(gl, loc, x, y, z);
+      if (c) return orig3f.call(gl, loc, c[0], c[1], c[2]);
+      return orig3f.call(gl, loc, x, y, z);
+    };
+    gl.uniform3fv = function (loc, v) {
+      if (v && v.length === 3) {
+        var c = mapped(gl, loc, v[0], v[1], v[2]);
+        if (c) return orig3fv.call(gl, loc, new Float32Array(c));
+      }
+      return orig3fv.call(gl, loc, v);
+    };
+    gl.drawArrays = function () {
+      reapply(gl);
+      return origDraw.apply(gl, arguments);
+    };
+    gl.drawElements = function () {
+      reapply(gl);
+      return origDrawEl.apply(gl, arguments);
+    };
+    return gl;
+  };
+
+  window.wcrSetHue = function (h) {
+    if (typeof h !== "number" || !isFinite(h)) return;
+    hue = ((h % 360) + 360) % 360;
+    var pet = window.__pet;
+    if (pet && typeof pet.noteActivity === "function") pet.noteActivity();
+  };
+})();
+</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script src="pet.js"></script>
+<script>
+(function () {
+  var OP = "daimon-pet:window-op";
+  var RES = "daimon-pet:window-op-result";
+
+  function state() {
+    var w = Math.max(72, window.innerWidth || 88);
+    var h = Math.max(72, window.innerHeight || 88);
+    var box = Math.max(1, Math.min(4096, Math.round(Math.min(w, h))));
+    return {
+      x: 0,
+      y: 0,
+      width: w,
+      height: h,
+      workArea: { x: 0, y: 0, width: w, height: h },
+      anchor: { xRatio: 0.5, bottomRatio: 1 },
+      dockSide: null,
+      displaySize: box,
+      edgeStickEnabled: false,
+      edgeCrawlEnabled: false
+    };
+  }
+
+  // pet.js posts to parent and only accepts replies whose source is parent.
+  // This page is the top frame, so parent is this window. Reply on the same
+  // window before mount(), or the first get-state times out and the pet
+  // disables itself. Edge crawl must be explicitly false.
+  window.addEventListener("message", function (ev) {
+    var data = ev.data;
+    if (!data || data.type !== OP || ev.source !== window) return;
+    var reply = { type: RES, id: data.id, ok: true };
+    if (data.op === "get-state") {
+      reply.state = state();
+    } else if (data.op !== "open-work" && data.op !== "set-position" &&
+               data.op !== "set-anchor" && data.op !== "set-layout" &&
+               data.op !== "set-dock-side") {
+      reply.ok = false;
+      reply.error = "unsupported";
+    }
+    window.postMessage(reply, "*");
+  });
+
+  var canvas = document.getElementById("c");
+  window.__pet = null;
+  window.__wcrReady = false;
+  window.__wcrError = "";
+  try {
+    if (!window.DaimonPetThree || typeof window.DaimonPetThree.mount !== "function") {
+      throw new Error("DaimonPetThree missing");
+    }
+    window.__pet = window.DaimonPetThree.mount(canvas);
+    window.__wcrReady = true;
+  } catch (err) {
+    window.__wcrError = String(err && err.message ? err.message : err);
+  }
+
+  window.wcrSetCursor = function (x, y, hovering, dragX) {
+    var pet = window.__pet;
+    if (!pet || typeof pet.setCursor !== "function") return;
+    if (typeof dragX === "number") pet.setCursor(x, y, !!hovering, dragX);
+    else pet.setCursor(x, y, !!hovering);
+  };
+  window.wcrSetDragging = function (on, cancelled) {
+    var pet = window.__pet;
+    if (pet && typeof pet.setDragging === "function") pet.setDragging(!!on, !!cancelled);
+  };
+  window.wcrNoteInteraction = function () {
+    var pet = window.__pet;
+    if (pet && typeof pet.noteInteraction === "function") pet.noteInteraction();
+  };
+  // 拖菜单滑杆时网页视口还没跟上，必须先把画布设成目标边长再 resize。
+  window.wcrResize = function (w, h) {
+    var pet = window.__pet;
+    var canvas = document.getElementById("c");
+    if (canvas && typeof w === "number" && w > 0) {
+      var height = (typeof h === "number" && h > 0) ? h : w;
+      canvas.style.width = w + "px";
+      canvas.style.height = height + "px";
+    }
+    if (pet && typeof pet.resize === "function") pet.resize();
+  };
+})();
+</script>
+</body>
+</html>

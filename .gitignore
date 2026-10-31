@@ -1,0 +1,11 @@
+build/
+private/
+.DS_Store
+__pycache__/
+*.py[cod]
+*.log
+DerivedData/
+xcuserdata/
+.idea/
+.vscode/
+dist/

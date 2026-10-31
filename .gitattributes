@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.plist text eol=lf
+*.js text eol=lf
+*.mm text eol=lf
+*.m text eol=lf
+*.h text eol=lf
+*.sh text eol=lf
