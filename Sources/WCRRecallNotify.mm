@@ -45,6 +45,57 @@ constexpr uint64_t kExtGlobalBOffset = 0xA51F710;
 // 转发函数随后会解引用空对象。调用前必须自己检查，SIGSEGV 不能用 catch 拦。
 constexpr uint64_t kForwardServiceGlobalOffset = 0xA45DF38;
 
+// 270351 的复制、转发和消息虚表与复读同一批入口。转发服务全局由 6 处
+// ADRP+LDR 独立对上 0xa5b5968，落在 __DATA 未初始化区。转换函数后半段已变，
+// 这一版不调用它，文字通知走本地外壳。
+struct NotifySites {
+    const char *build;
+    uint64_t messageCopy;
+    uint64_t messageDestroy;
+    uint64_t addRecipient;
+    uint64_t forwardMessage;
+    uint64_t messageDataVtable;
+    uint64_t forwardService;
+    uint64_t convert;
+};
+
+static const NotifySites kNotifySites[] = {
+    {
+        "270135",
+        kMessageCopyOffset,
+        kMessageDestroyOffset,
+        kAddRecipientOffset,
+        kForwardMessageOffset,
+        kMessageDataVtableOffset,
+        kForwardServiceGlobalOffset,
+        kConvertOffset,
+    },
+    {
+        "270351",
+        0x39769c,
+        0x398890,
+        0x180cb9c,
+        0x18c8100,
+        0xa002468,
+        0xa5b5968,
+        0,
+    },
+};
+
+static const NotifySites *gSites = nullptr;
+
+static const NotifySites *NotifySitesFor(const char *build) {
+    if (!build) return nullptr;
+    for (const NotifySites &sites : kNotifySites) {
+        if (strcmp(sites.build, build) == 0) return &sites;
+    }
+    return nullptr;
+}
+
+static uint64_t ActiveMessageDataVtable(void) {
+    return gSites ? gSites->messageDataVtable : kMessageDataVtableOffset;
+}
+
 constexpr size_t kMessageDataBytes = 0x350;
 constexpr size_t kMessageTypeOffset = 0x8;
 constexpr size_t kMessageBodyOffset = 0xB8;
@@ -395,7 +446,7 @@ bool MakeTextShell(uint8_t *bytes) {
 /// 通知文字只需要空的 type=1 MessageData，本地组外壳，不走 wrap 转换。
 bool InitializeEmptyTextShell(OwnedMessage *shell) {
     if (!shell) return false;
-    uintptr_t vtable = gSlide.load(std::memory_order_acquire) + kMessageDataVtableOffset;
+    uintptr_t vtable = gSlide.load(std::memory_order_acquire) + ActiveMessageDataVtable();
     if (!vtable || !gDestroy.load(std::memory_order_acquire)) return false;
 
     shell->clear();
@@ -565,7 +616,7 @@ bool ConvertSnapshot(const void *wrap, uint64_t serverID, OwnedMessage *out) {
     uintptr_t vtable = 0;
     memcpy(&vtable, converted.bytes, sizeof(vtable));
     const uintptr_t expected =
-        gSlide.load(std::memory_order_acquire) + kMessageDataVtableOffset;
+        gSlide.load(std::memory_order_acquire) + ActiveMessageDataVtable();
     if (vtable != expected) return false;
 
     uint32_t outType = 0;
@@ -693,13 +744,25 @@ bool Submit(void *message, const std::string &recipient, const char *kind) {
     // 微信的 Magicdy 热更新会在启动后改写这个入口。Prepare 时匹配并不代表
     // 异步发送时仍然匹配；继续按旧 ABI 调用会进入空的回调槽并跳到地址 0。
     const uintptr_t slide = gSlide.load(std::memory_order_acquire);
-    if (!slide || !VerifyEntry(slide, kForwardMessageOffset, kForwardPrologue,
-                               @"撤回通知转发", nullptr)) {
+    const bool legacy = gSites && strcmp(gSites->build, "270135") == 0;
+    const uint64_t forwardOffset = legacy ? kForwardMessageOffset : (gSites ? gSites->forwardMessage : 0);
+    const uint64_t serviceOffset = legacy ? kForwardServiceGlobalOffset
+                                          : (gSites ? gSites->forwardService : 0);
+    if (legacy) {
+        if (!slide || !VerifyEntry(slide, kForwardMessageOffset, kForwardPrologue,
+                                   @"撤回通知转发", nullptr)) {
+            os_log_error(NotifyLog(), "%{public}s skipped: forward entry changed", kind);
+            return false;
+        }
+    } else if (!slide || !forwardOffset ||
+               !VerifyEntry(slide, forwardOffset, kForwardPrologue,
+                            @"撤回通知转发", nullptr)) {
         os_log_error(NotifyLog(), "%{public}s skipped: forward entry changed", kind);
         return false;
     }
     uintptr_t forwardService = 0;
-    if (!SafeRead(reinterpret_cast<const void *>(slide + kForwardServiceGlobalOffset),
+    if (!serviceOffset ||
+        !SafeRead(reinterpret_cast<const void *>(slide + serviceOffset),
                   &forwardService, sizeof(forwardService)) || forwardService == 0) {
         os_log_info(NotifyLog(), "%{public}s skipped: forward service unavailable", kind);
         return false;
@@ -954,32 +1017,49 @@ void Deliver(BOOL wantSelf, BOOL wantSession, BOOL wantContacts, BOOL wantForwar
 
 BOOL WCRRecallNotifySupportsProfile(const WCRPatchProfile *profile) {
     if (!profile || !profile->buildVersion) return NO;
-    if (strcmp(profile->buildVersion, "270135") != 0) return NO;
-    return profile->messageFinalizerAddress != 0;
+    if (strcmp(profile->buildVersion, "270135") != 0 &&
+        strcmp(profile->buildVersion, "270351") != 0) return NO;
+    return profile->messageFinalizerAddress != 0 &&
+           NotifySitesFor(profile->buildVersion) != nullptr;
 }
 
 BOOL WCRRecallNotifyPrepare(NSError **error) {
     RefreshFlags();
     if (gReady.load(std::memory_order_acquire)) return YES;
 
+    const WCRPatchProfile *profile = WCRCurrentProcessProfile(nil);
+    gSites = NotifySitesFor(profile ? profile->buildVersion : nullptr);
+    if (!gSites) {
+        if (error) *error = NotifyError(@"当前微信构建没有撤回通知所需的入口");
+        return NO;
+    }
+
     uintptr_t slide = CurrentWeChatSlide();
     if (!slide) {
         if (error) *error = NotifyError(@"wechat.dylib 尚未加载");
         return NO;
     }
-    if (!VerifyEntry(slide, kMessageCopyOffset, kCopyPrologue, @"撤回通知消息复制", error) ||
-        !VerifyEntry(slide, kMessageDestroyOffset, kDestroyPrologue, @"撤回通知消息析构", error) ||
-        !VerifyEntry(slide, kAddRecipientOffset, kAddRecipientPrologue, @"撤回通知收件人", error) ||
-        !VerifyEntry(slide, kForwardMessageOffset, kForwardPrologue, @"撤回通知转发", error)) {
+    const bool legacy = strcmp(gSites->build, "270135") == 0;
+    if (legacy) {
+        if (!VerifyEntry(slide, kMessageCopyOffset, kCopyPrologue, @"撤回通知消息复制", error) ||
+            !VerifyEntry(slide, kMessageDestroyOffset, kDestroyPrologue, @"撤回通知消息析构", error) ||
+            !VerifyEntry(slide, kAddRecipientOffset, kAddRecipientPrologue, @"撤回通知收件人", error) ||
+            !VerifyEntry(slide, kForwardMessageOffset, kForwardPrologue, @"撤回通知转发", error)) {
+            return NO;
+        }
+    } else if (!VerifyEntry(slide, gSites->messageCopy, kCopyPrologue, @"撤回通知消息复制", error) ||
+               !VerifyEntry(slide, gSites->messageDestroy, kDestroyPrologue, @"撤回通知消息析构", error) ||
+               !VerifyEntry(slide, gSites->addRecipient, kAddRecipientPrologue, @"撤回通知收件人", error) ||
+               !VerifyEntry(slide, gSites->forwardMessage, kForwardPrologue, @"撤回通知转发", error)) {
         return NO;
     }
 
     gSlide.store(slide, std::memory_order_release);
-    gCopy.store(slide + kMessageCopyOffset, std::memory_order_release);
-    gDestroy.store(slide + kMessageDestroyOffset, std::memory_order_release);
-    gAddRecipient.store(slide + kAddRecipientOffset, std::memory_order_release);
-    gForward.store(slide + kForwardMessageOffset, std::memory_order_release);
-    if (VerifyEntry(slide, kConvertOffset, kConvertPrologue, @"撤回通知转换", nullptr)) {
+    gCopy.store(slide + gSites->messageCopy, std::memory_order_release);
+    gDestroy.store(slide + gSites->messageDestroy, std::memory_order_release);
+    gAddRecipient.store(slide + gSites->addRecipient, std::memory_order_release);
+    gForward.store(slide + gSites->forwardMessage, std::memory_order_release);
+    if (legacy && VerifyEntry(slide, kConvertOffset, kConvertPrologue, @"撤回通知转换", nullptr)) {
         gConvert.store(slide + kConvertOffset, std::memory_order_release);
     } else {
         gConvert.store(0, std::memory_order_release);

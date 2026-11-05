@@ -10,7 +10,7 @@ OBJC_FLAGS := $(COMMON_FLAGS) -fobjc-arc -fblocks -std=gnu++20 -O2
 PLUGIN_SOURCES := Sources/WCRefineMac.mm Sources/WCRPatchProfiles.mm \
 	Sources/WCRRecallTip.mm Sources/WCRCodePatch.mm Sources/WCROriginalID.mm \
 	Sources/WCRVoiceForward.mm Sources/WCRAvatarRound.mm \
-	Sources/WCRMessageRepeat.mm \
+	Sources/WCRMessageRepeat.mm Sources/WCRCommentRepeat.mm \
 	Sources/WCRMessageCapture.mm Sources/WCRGroupLeaveMonitor.mm \
 	Sources/WCRFloatingID.mm Sources/WCRScreenCapture.mm \
 	Sources/WCRAutoUpdate.mm \
@@ -44,7 +44,7 @@ $(PET_STAGE)/pet.js: $(PET_JS) Resources/kimi-pet/index.html
 	cp Resources/kimi-pet/index.html $(PET_STAGE)/index.html
 	cp "$(PET_JS)" $(PET_STAGE)/pet.js
 
-$(BUILD_DIR)/WCRefineMac.dylib: $(PLUGIN_SOURCES) Sources/WCRPatchProfiles.h Sources/WCRRecallTip.h Sources/WCRCodePatch.h Sources/WCROriginalID.h Sources/WCRVoiceForward.h Sources/WCRAvatarRound.h Sources/WCRMessageRepeat.h Sources/WCRMessageCapture.h Sources/WCRGroupLeaveMonitor.h Sources/WCRFloatingID.h Sources/WCRScreenCapture.h Sources/WCRAutoUpdate.h Sources/WCRContactName.h Sources/WCRConfigStore.h Sources/WCRContactPicker.h Sources/WCRSessionSelect.h Sources/WCRRecallNotify.h $(PET_STAGE)/pet.js
+$(BUILD_DIR)/WCRefineMac.dylib: $(PLUGIN_SOURCES) Sources/WCRPatchProfiles.h Sources/WCRRecallTip.h Sources/WCRCodePatch.h Sources/WCROriginalID.h Sources/WCRVoiceForward.h Sources/WCRAvatarRound.h Sources/WCRMessageRepeat.h Sources/WCRCommentRepeat.h Sources/WCRMessageCapture.h Sources/WCRGroupLeaveMonitor.h Sources/WCRFloatingID.h Sources/WCRScreenCapture.h Sources/WCRAutoUpdate.h Sources/WCRContactName.h Sources/WCRConfigStore.h Sources/WCRContactPicker.h Sources/WCRSessionSelect.h Sources/WCRRecallNotify.h $(PET_STAGE)/pet.js
 	@mkdir -p $(BUILD_DIR)
 	$(CXX) $(OBJC_FLAGS) -dynamiclib \
 		-install_name @rpath/WCRefineMac.dylib \

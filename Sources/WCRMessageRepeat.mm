@@ -57,6 +57,88 @@ constexpr uint64_t kMenuItemDestroyOffset = 0x1fa03c;
 constexpr uint64_t kMessageDataVtableOffset = 0x9eb6620;
 constexpr uint32_t kForwardPrologue[4] = {0xd10643ff, 0xa9136ffc, 0xa91467fa, 0xa9155ff8};
 
+// 运行时按构建取地址。270135 的数字就是上面的常量，测试仍核对那些字面量。
+// 270351 的入口由两份 arm64 切片的唯一指令窗口对上，序言与 270135 相同。
+struct RepeatSites {
+    const char *build;
+    uint64_t buildMenu;
+    uint64_t addMenuItem;
+    uint64_t makeTitle;
+    uint64_t actionVtable;
+    uint64_t actionClone;
+    uint64_t actionInvoke;
+    uint64_t targetMalloc;
+    uint64_t targetFree;
+    uint64_t qstringFree;
+    uint64_t messageCopy;
+    uint64_t messageDestroy;
+    uint64_t addRecipient;
+    uint64_t forwardMessage;
+    uint64_t menuStyle;
+    uint64_t menuItemCopy;
+    uint64_t menuItemMove;
+    uint64_t menuItemDestroy;
+    uint64_t messageDataVtable;
+};
+
+static const RepeatSites kRepeatSites[] = {
+    {
+        "270135",
+        kBuildMenuOffset,
+        kAddMenuItemOffset,
+        kMakeTitleOffset,
+        kActionVtableOffset,
+        0x6478dc,
+        0x647a00,
+        kTargetMallocOffset,
+        kTargetFreeOffset,
+        kQStringFreeOffset,
+        kMessageCopyOffset,
+        kMessageDestroyOffset,
+        kAddRecipientOffset,
+        kForwardMessageOffset,
+        kMenuStyleOffset,
+        kMenuItemCopyOffset,
+        kMenuItemMoveOffset,
+        kMenuItemDestroyOffset,
+        kMessageDataVtableOffset,
+    },
+    {
+        // 动作表 0x9d792f0 的 +0x10/+0x30 是 clone/invoke。
+        // 分配跳板是 operator new / operator delete，间距仍是 0x24。
+        // 消息虚表是复制函数里的符号地址 +0x10。
+        "270351",
+        0xd31de8,
+        0xd3176c,
+        0x7065338,
+        0x9d792f0,
+        0x64bdf0,
+        0x64bf14,
+        0x72acd48,
+        0x72acd24,
+        0x700e7dc,
+        0x39769c,
+        0x398890,
+        0x180cb9c,
+        0x18c8100,
+        0xa493088,
+        0xd329e0,
+        0xd32d08,
+        0x1fbae4,
+        0xa002468,
+    },
+};
+
+static const RepeatSites *gSites = nullptr;
+
+static const RepeatSites *RepeatSitesFor(const char *build) {
+    if (!build) return nullptr;
+    for (const RepeatSites &sites : kRepeatSites) {
+        if (strcmp(sites.build, build) == 0) return &sites;
+    }
+    return nullptr;
+}
+
 constexpr uint32_t kRepeatKey = 1001;
 constexpr uint32_t kMenuFlags = 2;
 // 原生转发 action（0x647a00）从 model+0x120 读取 MessageData：
@@ -319,7 +401,8 @@ static bool ReadMessageHeader(void *menuObject, uint32_t *typeOut, uint64_t *sou
         LogLine(@"header: message vtable unreadable");
         return false;
     }
-    const uintptr_t expected = gSlide.load(std::memory_order_acquire) + kMessageDataVtableOffset;
+    const uintptr_t expected = gSlide.load(std::memory_order_acquire) +
+        (gSites ? gSites->messageDataVtable : 0);
     if (vtable != expected) {
         LogLine([NSString stringWithFormat:@"header: vtable mismatch actual=%p expected=%p",
                  reinterpret_cast<void *>(vtable), reinterpret_cast<void *>(expected)]);
@@ -366,7 +449,7 @@ static bool SetupCallableVtable(uintptr_t slide, NSError **error) {
     if (gCallableVtable) return true;
 
     uint8_t original[kVtableBytes] = {};
-    const void *source = reinterpret_cast<const void *>(slide + kActionVtableOffset);
+    const void *source = reinterpret_cast<const void *>(slide + gSites->actionVtable);
     if (!SafeRead(source, original, sizeof(original))) {
         if (error) *error = RepeatError(@"复读菜单动作表不可读");
         return false;
@@ -384,7 +467,8 @@ static bool SetupCallableVtable(uintptr_t slide, NSError **error) {
     uintptr_t originalInvoke = 0;
     memcpy(&originalClone, original + 0x10, sizeof(originalClone));
     memcpy(&originalInvoke, original + 0x30, sizeof(originalInvoke));
-    if (originalClone != slide + 0x6478dc || originalInvoke != slide + 0x647a00) {
+    if (!gSites || originalClone != slide + gSites->actionClone ||
+        originalInvoke != slide + gSites->actionInvoke) {
         munmap(copy, kVtableBytes);
         if (error) *error = RepeatError(@"复读动作表布局不匹配");
         return false;
@@ -507,7 +591,7 @@ static void AppendRepeatItem(void *menuObject) {
         }
 
         static const char titleBytes[] = "复读";
-        void *title = reinterpret_cast<MakeTitleFn>(gSlide.load() + kMakeTitleOffset)(
+        void *title = reinterpret_cast<MakeTitleFn>(gSlide.load() + gSites->makeTitle)(
             titleBytes, -1);
         if (!title) {
             DeleteAction(action);
@@ -516,7 +600,8 @@ static void AppendRepeatItem(void *menuObject) {
         }
 
         uint8_t style[kMenuStyleBytes] = {};
-        if (!SafeRead(reinterpret_cast<const void *>(gSlide.load() + kMenuStyleOffset),
+        if (!gSites ||
+            !SafeRead(reinterpret_cast<const void *>(gSlide.load() + gSites->menuStyle),
                       style, sizeof(style))) {
             ReleaseRefcounted(title);
             DeleteAction(action);
@@ -529,7 +614,7 @@ static void AppendRepeatItem(void *menuObject) {
         memcpy(holder + 0x18, &actionAddress, sizeof(actionAddress));
 
         int flags = kMenuFlags;
-        reinterpret_cast<AddMenuItemFn>(gSlide.load() + kAddMenuItemOffset)(
+        reinterpret_cast<AddMenuItemFn>(gSlide.load() + gSites->addMenuItem)(
             menuObject, kRepeatKey, &title, &flags, holder, style);
         ReleaseRefcounted(title);
         DeleteAction(action);
@@ -571,7 +656,8 @@ static bool SubmitMessage(RepeatPayload *payload) {
         return false;
     }
     const uintptr_t slide = gSlide.load(std::memory_order_acquire);
-    if (!slide || !VerifyEntry(slide, kForwardMessageOffset, kForwardPrologue,
+    if (!slide || !gSites ||
+        !VerifyEntry(slide, gSites->forwardMessage, kForwardPrologue,
                                "复读原生转发", nil)) {
         LogLine(@"invoke: native forward entry changed; skipped");
         return false;
@@ -701,15 +787,16 @@ __attribute__((naked)) extern "C" void WCRMessageRepeatInvokeStub(void) {
 
 BOOL WCRMessageRepeatSupportsProfile(const WCRPatchProfile *profile) {
     return profile && profile->repeatMenuBuilderAddress != 0 &&
-           strcmp(profile->buildVersion, "270135") == 0;
+           RepeatSitesFor(profile->buildVersion) != nullptr;
 }
 
 BOOL WCRMessageRepeatInstall(const WCRPatchProfile *profile, NSError **error) {
     if (gInstalled.load()) return YES;
     if (!WCRMessageRepeatSupportsProfile(profile)) {
-        if (error) *error = RepeatError(@"消息复读仅支持 270135（4.1.15.55）");
+        if (error) *error = RepeatError(@"当前微信构建没有复读所需的入口");
         return NO;
     }
+    gSites = RepeatSitesFor(profile->buildVersion);
 
     uintptr_t slide = CurrentWeChatSlide();
     if (!slide) {
@@ -717,7 +804,7 @@ BOOL WCRMessageRepeatInstall(const WCRPatchProfile *profile, NSError **error) {
         return NO;
     }
 
-    auto *entry = reinterpret_cast<uint8_t *>(slide + kBuildMenuOffset);
+    auto *entry = reinterpret_cast<uint8_t *>(slide + gSites->buildMenu);
     uint8_t current[16] = {};
     if (!SafeRead(entry, current, sizeof(current))) {
         if (error) *error = RepeatError(@"无法读取复读菜单入口");
@@ -743,15 +830,15 @@ BOOL WCRMessageRepeatInstall(const WCRPatchProfile *profile, NSError **error) {
     static const uint32_t itemMovePrologue[4] = {0xa9bd57f6, 0xa9014ff4, 0xa9027bfd, 0x910083fd};
     static const uint32_t itemDestroyPrologue[4] = {0xa9be4ff4, 0xa9017bfd, 0x910043fd, 0xaa0003f3};
 
-    if (!VerifyEntry(slide, kAddMenuItemOffset, menuPrologue, "复读添加菜单项", error) ||
-        !VerifyEntry(slide, kMakeTitleOffset, titlePrologue, "复读标题构造", error) ||
-        !VerifyEntry(slide, kMessageCopyOffset, messageCopyPrologue, "复读消息快照", error) ||
-        !VerifyEntry(slide, kMessageDestroyOffset, messageDestroyPrologue, "复读消息快照析构", error) ||
-        !VerifyEntry(slide, kAddRecipientOffset, addRecipientPrologue, "复读目标插入", error) ||
-        !VerifyEntry(slide, kForwardMessageOffset, kForwardPrologue, "复读原生转发", error) ||
-        !VerifyEntry(slide, kMenuItemCopyOffset, itemCopyPrologue, "复读菜单项复制", error) ||
-        !VerifyEntry(slide, kMenuItemMoveOffset, itemMovePrologue, "复读菜单项移动", error) ||
-        !VerifyEntry(slide, kMenuItemDestroyOffset, itemDestroyPrologue, "复读菜单项析构", error)) {
+    if (!VerifyEntry(slide, gSites->addMenuItem, menuPrologue, "复读添加菜单项", error) ||
+        !VerifyEntry(slide, gSites->makeTitle, titlePrologue, "复读标题构造", error) ||
+        !VerifyEntry(slide, gSites->messageCopy, messageCopyPrologue, "复读消息快照", error) ||
+        !VerifyEntry(slide, gSites->messageDestroy, messageDestroyPrologue, "复读消息快照析构", error) ||
+        !VerifyEntry(slide, gSites->addRecipient, addRecipientPrologue, "复读目标插入", error) ||
+        !VerifyEntry(slide, gSites->forwardMessage, kForwardPrologue, "复读原生转发", error) ||
+        !VerifyEntry(slide, gSites->menuItemCopy, itemCopyPrologue, "复读菜单项复制", error) ||
+        !VerifyEntry(slide, gSites->menuItemMove, itemMovePrologue, "复读菜单项移动", error) ||
+        !VerifyEntry(slide, gSites->menuItemDestroy, itemDestroyPrologue, "复读菜单项析构", error)) {
         return NO;
     }
 
@@ -786,16 +873,16 @@ BOOL WCRMessageRepeatInstall(const WCRPatchProfile *profile, NSError **error) {
     memcpy(patch + 8, &hookAddress, sizeof(hookAddress));
 
     gSlide.store(slide);
-    gTargetMalloc = reinterpret_cast<void *>(slide + kTargetMallocOffset);
-    gTargetFree = reinterpret_cast<void *>(slide + kTargetFreeOffset);
-    gQStringFree = reinterpret_cast<void *>(slide + kQStringFreeOffset);
-    gMessageCopy = reinterpret_cast<void *>(slide + kMessageCopyOffset);
-    gMessageDestroy = reinterpret_cast<void *>(slide + kMessageDestroyOffset);
-    gAddRecipient = reinterpret_cast<void *>(slide + kAddRecipientOffset);
-    gForwardMessage = reinterpret_cast<void *>(slide + kForwardMessageOffset);
-    gMenuItemCopy = reinterpret_cast<void *>(slide + kMenuItemCopyOffset);
-    gMenuItemMove = reinterpret_cast<void *>(slide + kMenuItemMoveOffset);
-    gMenuItemDestroy = reinterpret_cast<void *>(slide + kMenuItemDestroyOffset);
+    gTargetMalloc = reinterpret_cast<void *>(slide + gSites->targetMalloc);
+    gTargetFree = reinterpret_cast<void *>(slide + gSites->targetFree);
+    gQStringFree = reinterpret_cast<void *>(slide + gSites->qstringFree);
+    gMessageCopy = reinterpret_cast<void *>(slide + gSites->messageCopy);
+    gMessageDestroy = reinterpret_cast<void *>(slide + gSites->messageDestroy);
+    gAddRecipient = reinterpret_cast<void *>(slide + gSites->addRecipient);
+    gForwardMessage = reinterpret_cast<void *>(slide + gSites->forwardMessage);
+    gMenuItemCopy = reinterpret_cast<void *>(slide + gSites->menuItemCopy);
+    gMenuItemMove = reinterpret_cast<void *>(slide + gSites->menuItemMove);
+    gMenuItemDestroy = reinterpret_cast<void *>(slide + gSites->menuItemDestroy);
     gWCRMessageRepeatTrampoline = trampoline;
 
     NSError *patchError = nil;

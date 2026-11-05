@@ -64,8 +64,8 @@ typedef struct {
     uint32_t voiceMenuGatePrologue[4];
 
     /// Optional text-message long-press menu builder for 消息复读.
-    /// 270135: 0xcf46ac (BuildMenu). Zero on other builds: helper entry points
-    /// used by the feature are version-specific and must not be guessed.
+    /// 270135: 0xcf46ac. 270351: 0xd31de8. Helper addresses live beside the
+    /// profile and are selected by build. Zero means the switch stays off.
     uint64_t repeatMenuBuilderAddress;
     uint32_t repeatMenuBuilderPrologue[4];
 
@@ -84,6 +84,12 @@ typedef struct {
     /// 前 3 条指令可搬走，第 4 条是 adrp，必须留在原地。其它构建为 0。
     uint64_t sessionSelectAddress;
     uint32_t sessionSelectPrologue[3];
+
+    /// 朋友圈评论长按菜单构建函数。270351: 0x1bfd67c。菜单在 x0 返回，
+    /// 钩子先执行这 16 字节再追加「复读」。0 表示开关保持关闭。
+    /// 不是聊天复读的 repeatMenuBuilderAddress。
+    uint64_t commentMenuBuilderAddress;
+    uint32_t commentMenuBuilderPrologue[4];
 } WCRPatchProfile;
 
 typedef struct {

@@ -45,6 +45,9 @@ int main(int argc, const char *argv[]) {
         printf("build=%s\n", inspection.buildVersion.UTF8String ?: "");
         if (inspection.supported) {
             printf("state=%s\n", inspection.alreadyPatched ? "already-patched" : "pristine");
+            if (inspection.profile.patchAddress == 0) {
+                printf("note=防撤回补丁点未登记\n");
+            }
         } else if (inspection.failureReason.length) {
             printf("note=%s\n", inspection.failureReason.UTF8String);
         }

@@ -20,6 +20,7 @@ static NSString *const kWCRFloatingOffsetTopKey = @"WCRefineMacFloatingIDOffsetT
 static NSString *const kWCRFloatingBackgroundKey = @"WCRefineMacFloatingIDBackground";
 static NSString *const kWCRFloatingFontSizeKey = @"WCRefineMacFloatingIDFontSize";
 static NSString *const kWCRFloatingHueKey = @"WCRefineMacFloatingIDHue";
+static NSString *const kWCRPetBoundsMessageName = @"wcrPetBounds";
 static const CGFloat kWCRDefaultFontSize = 13.0;
 // 身体中心 #1D89FF 的色相。滑杆停在这里时页面不改色，避免把原来的蓝洗掉。
 static const CGFloat kWCRDefaultPetHue = 211.33;
@@ -153,10 +154,31 @@ static NSURL *WCRPetDirectory(void) {
 @property(nonatomic, assign) NSPoint dragStartOrigin;
 @property(nonatomic, assign) BOOL dragged;
 @property(nonatomic, assign) BOOL toldDrag;
+@property(nonatomic, assign) BOOL pressing;
+@property(nonatomic, assign) NSRect bodyBounds;
+@property(nonatomic, assign) BOOL bodyBoundsValid;
 - (void)copySessionID:(NSString *)sessionID;
 - (void)installChrome;
 - (void)loadPetIfNeeded;
 - (void)evalPet:(NSString *)script;
+- (void)updateBodyBounds:(NSDictionary *)body;
+- (BOOL)containsPetBodyAtPoint:(NSPoint)point;
+@end
+
+@interface WCRFloatingIDBoundsHandler : NSObject <WKScriptMessageHandler>
+@property(nonatomic, weak) WCRFloatingIDBadgeView *badge;
+@end
+
+@implementation WCRFloatingIDBoundsHandler
+
+- (void)userContentController:(WKUserContentController *)userContentController
+      didReceiveScriptMessage:(WKScriptMessage *)message {
+    (void)userContentController;
+    if (![message.name isEqualToString:kWCRPetBoundsMessageName]) return;
+    NSDictionary *body = [message.body isKindOfClass:[NSDictionary class]] ? message.body : nil;
+    if (body) [self.badge updateBodyBounds:body];
+}
+
 @end
 
 // -1 还没装过，0 纯宠物，1 玻璃底。用来避免每两秒拆一次视图。
@@ -180,6 +202,7 @@ static CFAbsoluteTime gHuePumpedAt = 0;
 static void WCRFloatingApplyFront(void);
 static void WCRFloatingReposition(void);
 static void WCRPushCursor(void);
+static void WCRUpdateMousePassthrough(void);
 
 @implementation WCRFloatingIDBadgeView
 
@@ -198,6 +221,9 @@ static void WCRPushCursor(void);
                                                    injectionTime:WKUserScriptInjectionTimeAtDocumentStart
                                                 forMainFrameOnly:YES];
     [scripts addUserScript:hueBoot];
+    WCRFloatingIDBoundsHandler *boundsHandler = [[WCRFloatingIDBoundsHandler alloc] init];
+    boundsHandler.badge = self;
+    [scripts addScriptMessageHandler:boundsHandler name:kWCRPetBoundsMessageName];
     config.userContentController = scripts;
     // 同目录的 pet.js 要能被 file URL 页面读到。
     @try {
@@ -267,6 +293,59 @@ static void WCRPushCursor(void);
     }];
 }
 
+- (void)updateBodyBounds:(NSDictionary *)body {
+    NSNumber *x = body[@"x"];
+    NSNumber *y = body[@"y"];
+    NSNumber *width = body[@"width"];
+    NSNumber *height = body[@"height"];
+    if (![x isKindOfClass:[NSNumber class]] ||
+        ![y isKindOfClass:[NSNumber class]] ||
+        ![width isKindOfClass:[NSNumber class]] ||
+        ![height isKindOfClass:[NSNumber class]]) {
+        return;
+    }
+    CGFloat xValue = x.doubleValue;
+    CGFloat yValue = y.doubleValue;
+    CGFloat widthValue = width.doubleValue;
+    CGFloat heightValue = height.doubleValue;
+    if (!isfinite(xValue) || !isfinite(yValue) ||
+        !isfinite(widthValue) || !isfinite(heightValue) ||
+        widthValue <= 0 || heightValue <= 0) {
+        return;
+    }
+    self.bodyBounds = NSMakeRect(xValue, yValue, widthValue, heightValue);
+    self.bodyBoundsValid = YES;
+    WCRUpdateMousePassthrough();
+}
+
+- (BOOL)containsPetBodyAtPoint:(NSPoint)point {
+    if (!self.webView) return NO;
+    NSPoint webPoint = [self.webView convertPoint:point fromView:self];
+    if (!self.webView.isFlipped) {
+        webPoint.y = NSHeight(self.webView.bounds) - webPoint.y;
+    }
+
+    NSRect body = self.bodyBounds;
+    if (!self.bodyBoundsValid || !isfinite(body.origin.x) || !isfinite(body.origin.y) ||
+        !isfinite(body.size.width) || !isfinite(body.size.height) ||
+        body.size.width <= 0 || body.size.height <= 0) {
+        // 页面边界消息还没到时先用居中的保守椭圆，不能退回整块方形窗口。
+        CGFloat side = MIN(NSWidth(self.bounds), NSHeight(self.bounds));
+        CGFloat diameter = side * 0.46;
+        body = NSMakeRect((NSWidth(self.bounds) - diameter) / 2.0,
+                          (NSHeight(self.bounds) - diameter) / 2.0,
+                          diameter,
+                          diameter);
+    }
+    CGFloat inset = MIN(2.0, MIN(body.size.width, body.size.height) * 0.04);
+    body = NSInsetRect(body, inset, inset);
+    if (body.size.width <= 0 || body.size.height <= 0) return NO;
+
+    CGFloat nx = (webPoint.x - NSMidX(body)) / (body.size.width / 2.0);
+    CGFloat ny = (webPoint.y - NSMidY(body)) / (body.size.height / 2.0);
+    return nx * nx + ny * ny <= 1.0;
+}
+
 - (void)installChrome {
     if (self.glassView) {
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
@@ -315,8 +394,8 @@ static void WCRPushCursor(void);
 }
 
 - (NSView *)hitTest:(NSPoint)point {
-    // 整块都是宠物。点在透明边上也能拖、能复制，不把点击交给网页。
-    if (!NSPointInRect(point, self.bounds)) return nil;
+    // 只有果冻身体接收点击；透明边交给下面的微信窗口。
+    if (![self containsPetBodyAtPoint:point]) return nil;
     return self;
 }
 
@@ -332,6 +411,7 @@ static void WCRPushCursor(void);
 }
 
 - (void)mouseDown:(NSEvent *)event {
+    self.pressing = YES;
     self.dragStartMouse = NSEvent.mouseLocation;
     self.dragStartOrigin = self.window.frame.origin;
     self.dragged = NO;
@@ -368,6 +448,7 @@ static void WCRPushCursor(void);
 }
 
 - (void)mouseUp:(NSEvent *)event {
+    self.pressing = NO;
     if (self.dragged) {
         [self evalPet:@"window.wcrSetDragging(false,false)"];
         NSWindow *target = WCRLargestChatWindow();
@@ -380,11 +461,16 @@ static void WCRPushCursor(void);
         }
         self.dragged = NO;
         self.toldDrag = NO;
+        WCRUpdateMousePassthrough();
         return;
     }
-    if (event.clickCount >= 2) return;
+    if (event.clickCount >= 2) {
+        WCRUpdateMousePassthrough();
+        return;
+    }
     [self evalPet:@"window.wcrNoteInteraction()"];
     [self copySessionID:self.currentID];
+    WCRUpdateMousePassthrough();
 }
 
 - (void)copySessionID:(NSString *)sessionID {
@@ -522,7 +608,24 @@ static void WCRFloatingReposition(void) {
 }
 
 // 把屏幕上的鼠标换成宠物画布的坐标。画布原点在左上，眼睛用这个方向看。
+static void WCRUpdateMousePassthrough(void) {
+    if (!gPanel || !gBadge) return;
+    BOOL interactive = gBadge.pressing || gBadge.dragged;
+    if (!interactive) {
+        NSPoint screenPoint = NSEvent.mouseLocation;
+        NSPoint windowPoint = [gPanel convertPointFromScreen:screenPoint];
+        NSPoint badgePoint = [gBadge convertPoint:windowPoint fromView:nil];
+        interactive = [gBadge containsPetBodyAtPoint:badgePoint];
+    }
+    BOOL shouldIgnore = !interactive;
+    if (gPanel.ignoresMouseEvents != shouldIgnore) {
+        gPanel.ignoresMouseEvents = shouldIgnore;
+    }
+}
+
 static void WCRPushCursor(void) {
+    if (!gPanel || !gBadge) return;
+    WCRUpdateMousePassthrough();
     if (!gPetReady || !gPanel.visible || !gBadge.webView) return;
     NSPoint screen = NSEvent.mouseLocation;
     if (hypot(screen.x - gLastCursor.x, screen.y - gLastCursor.y) < 0.5) return;
@@ -598,6 +701,7 @@ static void WCRFloatingApplyFront(void) {
     NSRect frame = gPanel.frame;
     BOOL resized = fabs(frame.size.width - side) > 0.5 || fabs(frame.size.height - side) > 0.5;
     if (resized) {
+        if (gBadge) gBadge.bodyBoundsValid = NO;
         // 菜单和弹窗都在追踪循环里，主队列要等松手才跑。这里先改窗口，再同步通知网页。
         if (gBadge.dragged) {
             [gPanel setFrame:NSMakeRect(NSMaxX(frame) - side,
@@ -611,6 +715,7 @@ static void WCRFloatingApplyFront(void) {
         }
     }
     WCRFloatingLayoutPet();
+    if (resized) WCRUpdateMousePassthrough();
     if (resized && gPetReady) {
         NSString *script = [NSString stringWithFormat:@"window.wcrResize(%.0f,%.0f)", side, side];
         [gBadge evalPet:script];
@@ -669,7 +774,8 @@ BOOL WCRFloatingIDSetEnabled(BOOL enabled) {
     panel.opaque = NO;
     panel.backgroundColor = [NSColor clearColor];
     panel.hasShadow = NO;
-    panel.ignoresMouseEvents = NO;
+    // 面板默认让鼠标穿透；只有指针进入宠物身体时才临时接收点击。
+    panel.ignoresMouseEvents = YES;
     panel.collectionBehavior = NSWindowCollectionBehaviorFullScreenAuxiliary;
     panel.releasedWhenClosed = NO;
     panel.acceptsMouseMovedEvents = YES;
@@ -721,7 +827,8 @@ BOOL WCRFloatingIDSetEnabled(BOOL enabled) {
         (void)timer;
         WCRFloatingApplyFront();
     }];
-    gCursorTimer = [NSTimer scheduledTimerWithTimeInterval:0.05
+    // 穿透区域按指针实时切换；60Hz 可避免从消息提示移入宠物后首击落空。
+    gCursorTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 60.0
                                                    repeats:YES
                                                      block:^(NSTimer *timer) {
         (void)timer;

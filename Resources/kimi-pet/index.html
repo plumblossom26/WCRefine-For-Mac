@@ -217,11 +217,34 @@
   window.__pet = null;
   window.__wcrReady = false;
   window.__wcrError = "";
+  var boundsHandler = window.webkit && window.webkit.messageHandlers
+    ? window.webkit.messageHandlers.wcrPetBounds : null;
+  var lastBounds = null;
+  var lastBoundsAt = 0;
+  function reportBodyBounds(bounds) {
+    if (!boundsHandler || !bounds) return;
+    var x = Number(bounds.x), y = Number(bounds.y);
+    var width = Number(bounds.width), height = Number(bounds.height);
+    if (!isFinite(x) || !isFinite(y) || !isFinite(width) || !isFinite(height)) return;
+    if (width <= 0 || height <= 0) return;
+    var now = performance.now();
+    // 宠物会轻微呼吸/摆动，边界按 10Hz 同步就够了，避免每帧跨进程通信。
+    if (lastBounds && now - lastBoundsAt < 100) return;
+    if (lastBounds && Math.abs(lastBounds.x - x) < 1 &&
+        Math.abs(lastBounds.y - y) < 1 &&
+        Math.abs(lastBounds.width - width) < 1 &&
+        Math.abs(lastBounds.height - height) < 1) return;
+    lastBounds = { x: x, y: y, width: width, height: height };
+    lastBoundsAt = now;
+    boundsHandler.postMessage(lastBounds);
+  }
   try {
     if (!window.DaimonPetThree || typeof window.DaimonPetThree.mount !== "function") {
       throw new Error("DaimonPetThree missing");
     }
-    window.__pet = window.DaimonPetThree.mount(canvas);
+    window.__pet = window.DaimonPetThree.mount(canvas, {
+      onBodyBoundsChange: reportBodyBounds
+    });
     window.__wcrReady = true;
   } catch (err) {
     window.__wcrError = String(err && err.message ? err.message : err);

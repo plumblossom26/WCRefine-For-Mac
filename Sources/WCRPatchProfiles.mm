@@ -31,6 +31,10 @@ constexpr uint32_t kArm64CpuType = CPU_TYPE_ARM64;
 
 // Universal wechat.dylib SHA-256 evidence:
 //   270135: 5f5a81c4d8b000dec1c7203738fc4dba75ce752b55874fc1b6b5869f9dfb1027
+//   270351: 8b08e2f7af764ed4c3c28475d27fb3ebd74dd0de2515a5da677b07f02b88aebc
+// 270351 只登记字节窗口唯一、且序言与字段访问都对得上的入口。
+// 防撤回 cbz 在 0x4e79a44：两条 ADD 与 270135 相同，CBZ 立即数没变。
+// 解析器在补丁点前 0x270，灰字仍写 +0x1D0、+0x218、+0x230。
 const WCRPatchProfile kProfiles[] = {
     {
         .shortVersion = "4.1.15",
@@ -70,6 +74,52 @@ const WCRPatchProfile kProfiles[] = {
         // 第 4 条 adrp 留在 0x1361c4。序言不匹配就拒绝安装。
         .sessionSelectAddress = 0x1361b8,
         .sessionSelectPrologue = {0xD100C3FF, 0xA9027BFD, 0x910083FD},
+    },
+    {
+        .shortVersion = "4.2.0",
+        .buildVersion = "270351",
+        .displayVersion = "4.2.0.15",
+        .dylibSHA256 = "8b08e2f7af764ed4c3c28475d27fb3ebd74dd0de2515a5da677b07f02b88aebc",
+        // 唯一的 ADD X0,X19,#0x10 / ADD X1,SP,#0xD8。前一条仍是 CBZ X0,+0x208。
+        // 下一条 BL 立即数变了，整条 16 字节对不上；补丁只改这 4 字节。
+        .patchAddress = 0x4e79a44,
+        .expectedBytes = {0x40, 0x10, 0x00, 0x34},
+        .replacementBytes = {0x82, 0x00, 0x00, 0x14},
+        // 入口 = 补丁点 - 0x270。前 8 条与 270135 相同，跳板只搬前 16 字节。
+        .revokeParserAddress = 0x4e797d4,
+        .revokePrologue = {0xA9BC5FF8, 0xA90157F6, 0xA9024FF4, 0xA9037BFD},
+        .revokeNewMsgIdOffset = 0x1C8,
+        .revokeReplaceMsgOffset = 0x1D0,
+        // 终结器 0x4e1638c。相对 270135 0x4cbc3ac 的前 0x64 字节相同，
+        // 第一处不同是一条 BL 立即数。入口 b.eq 仍是 54000360，目标 = entry+0x78。
+        .messageFinalizerAddress = 0x4e1638c,
+        .messageFinalizerContinuation = 0x4e16398,
+        .messageFinalizerPrologue = {0x39496008, 0x7100051F, 0x7A400820, 0x54000360},
+        .messageServerIDOffset = 0xF8,
+        .messageTypeOffset = 0x0C,
+        .messageContentOffset = 0x130,
+        // 构造函数 0x4e15168：str w,[x19,#0x114]；movz #1000；随后 str x,[x19,#0x100]。
+        // 同函数 ldr x,[x19,#0x130]。终结器仍访问 +0x0C / +0xF8 / +0x218 / +0x230。
+        .messageCreateTimeSecOffset = 0x114,
+        .messageCreateTimeMsOffset = 0x100,
+        // 0x4e7a420：ADD X0,X19,#0x218；ADD X1,X19,#0x1D0。下一条同样把 #0x230 赋过去。
+        .revokeDisplayCopyOffsetA = 0x218,
+        .revokeDisplayCopyOffsetB = 0x230,
+        .voiceMenuGateAddress = 0x4e94da8,
+        .voiceMenuGatePrologue = {0xD10103FF, 0xA9024FF4, 0xA9037BFD, 0x9100C3FD},
+        // 长按菜单收口。前 16 字节与 270135 相同，内部窗口回推入口 0xd31de8。
+        .repeatMenuBuilderAddress = 0xd31de8,
+        .repeatMenuBuilderPrologue = {0xA9BA6FFC, 0xA90167FA, 0xA9025FF8, 0xA90357F6},
+        .avatarShapeAddress = 0x1fabcd4,
+        .avatarShapePrologue = {0xD104C3FF, 0x6D0C2BEB, 0x6D0D23E9, 0xA90E67FA},
+        // 48 字节内部窗口在两份切片里都只命中一次，回推入口 0x135920。
+        // 前 12 字节与 270135 相同。第 4 条仍是 adrp（b004da28），钩子留在原地。
+        .sessionSelectAddress = 0x135920,
+        .sessionSelectPrologue = {0xD100C3FF, 0xA9027BFD, 0x910083FD},
+        // 评论行 OnContextMenu 调用的菜单构建函数。前 16 字节是可搬走的 stp。
+        // 第 5 条仍留在 0x1bfd68c。序言不匹配就拒绝安装。270135 不登记。
+        .commentMenuBuilderAddress = 0x1bfd67c,
+        .commentMenuBuilderPrologue = {0x6DB923E9, 0xA9016FFC, 0xA90267FA, 0xA9035FF8},
     },
 };
 
@@ -317,28 +367,31 @@ BOOL WCRCheckDylibProfile(NSString *path,
     }
     const uint8_t *slice = static_cast<const uint8_t *>(data.bytes) + sliceOffset;
 
-    uint64_t patchOffset = 0;
-    if (!WCRFileOffsetForVA(slice, sliceSize, profile->patchAddress, &patchOffset, error)) {
-        return NO;
-    }
-    if (patchOffset > sliceSize || sliceSize - patchOffset < sizeof(profile->expectedBytes)) {
-        if (error) *error = WCRError(@"补丁地址映射越界");
-        return NO;
-    }
-    const uint8_t *actual = slice + patchOffset;
-    if (memcmp(actual, profile->expectedBytes, sizeof(profile->expectedBytes)) == 0) {
-        *alreadyPatched = NO;
-    } else if (memcmp(actual, profile->replacementBytes, sizeof(profile->replacementBytes)) == 0) {
-        *alreadyPatched = YES;
-    } else {
-        NSMutableString *bytes = [NSMutableString string];
-        for (size_t index = 0; index < sizeof(profile->expectedBytes); ++index) {
-            [bytes appendFormat:@"%02X", actual[index]];
+    // 防撤回 cbz 还没对上时地址是 0。不能去读 VA 0（那是 Mach-O 头）。
+    if (profile->patchAddress != 0) {
+        uint64_t patchOffset = 0;
+        if (!WCRFileOffsetForVA(slice, sliceSize, profile->patchAddress, &patchOffset, error)) {
+            return NO;
         }
-        if (failureReason) {
-            *failureReason = [NSString stringWithFormat:@"补丁点字节不匹配（当前 %@）", bytes];
+        if (patchOffset > sliceSize || sliceSize - patchOffset < sizeof(profile->expectedBytes)) {
+            if (error) *error = WCRError(@"补丁地址映射越界");
+            return NO;
         }
-        return YES;
+        const uint8_t *actual = slice + patchOffset;
+        if (memcmp(actual, profile->expectedBytes, sizeof(profile->expectedBytes)) == 0) {
+            *alreadyPatched = NO;
+        } else if (memcmp(actual, profile->replacementBytes, sizeof(profile->replacementBytes)) == 0) {
+            *alreadyPatched = YES;
+        } else {
+            NSMutableString *bytes = [NSMutableString string];
+            for (size_t index = 0; index < sizeof(profile->expectedBytes); ++index) {
+                [bytes appendFormat:@"%02X", actual[index]];
+            }
+            if (failureReason) {
+                *failureReason = [NSString stringWithFormat:@"补丁点字节不匹配（当前 %@）", bytes];
+            }
+            return YES;
+        }
     }
 
     struct EntryCheck {
@@ -355,6 +408,7 @@ BOOL WCRCheckDylibProfile(NSString *path,
         {profile->repeatMenuBuilderAddress, profile->repeatMenuBuilderPrologue, 4, @"复读菜单入口"},
         {profile->avatarShapeAddress, profile->avatarShapePrologue, 4, @"头像绘制入口"},
         {profile->sessionSelectAddress, profile->sessionSelectPrologue, 3, @"会话切换入口"},
+        {profile->commentMenuBuilderAddress, profile->commentMenuBuilderPrologue, 4, @"朋友圈评论菜单入口"},
     };
     for (const EntryCheck &check : checks) {
         if (check.address == 0) continue;
@@ -442,6 +496,11 @@ BOOL WCRCheckCurrentProcessBytes(const WCRPatchProfile *profile,
     if (!profile) {
         if (error) *error = WCRError(@"缺少版本配置");
         return NO;
+    }
+    if (profile->patchAddress == 0) {
+        // 未登记不是“字节坏了”，也不是已经打上。调用方禁止就此写入。
+        if (state) *state = WCRPatchStatePristine;
+        return YES;
     }
     uintptr_t slide = 0;
     if (!WCRFindLoadedWeChatDylib(&slide)) {
@@ -539,6 +598,10 @@ BOOL WCRInspectWeChatApp(NSString *appPath, WCRAppInspection *inspection, NSErro
 BOOL WCRApplyAntiRevokePatch(NSError **error) {
     const WCRPatchProfile *profile = WCRProfileForMainBundle(error);
     if (!profile) return NO;
+    if (profile->patchAddress == 0) {
+        if (error) *error = WCRError(@"当前微信构建未登记防撤回补丁点");
+        return NO;
+    }
     WCRPatchState state = WCRPatchStateUnavailable;
     if (!WCRCheckCurrentProcessBytes(profile, &state, error)) return NO;
     if (state == WCRPatchStateApplied) return YES;
@@ -557,6 +620,8 @@ BOOL WCRApplyAntiRevokePatch(NSError **error) {
 BOOL WCRRestoreAntiRevokePatch(NSError **error) {
     const WCRPatchProfile *profile = WCRProfileForMainBundle(error);
     if (!profile) return NO;
+    // 没登记补丁点就没有可恢复的 4 字节。关掉开关必须成功，否则勾着就关不掉。
+    if (profile->patchAddress == 0) return YES;
     WCRPatchState state = WCRPatchStateUnavailable;
     if (!WCRCheckCurrentProcessBytes(profile, &state, error)) return NO;
     if (state == WCRPatchStatePristine) return YES;

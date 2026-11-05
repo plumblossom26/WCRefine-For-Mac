@@ -1,5 +1,6 @@
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 #import <os/log.h>
 #import <mach-o/dyld.h>
@@ -11,6 +12,7 @@
 #import "WCRVoiceForward.h"
 #import "WCRAvatarRound.h"
 #import "WCRMessageRepeat.h"
+#import "WCRCommentRepeat.h"
 #import "WCRMessageCapture.h"
 #import "WCRGroupLeaveMonitor.h"
 #import "WCRScreenCapture.h"
@@ -33,13 +35,14 @@ static NSString *const kWCRDefaultsKeyOriginalIDEnabled = @"WCRefineMacOriginalI
 static NSString *const kWCRDefaultsKeyFloatingIDEnabled = @"WCRefineMacFloatingIDEnabled";
 static NSString *const kWCRDefaultsKeyVoiceForwardEnabled = @"WCRefineMacVoiceForwardEnabled";
 static NSString *const kWCRDefaultsKeyMessageRepeatEnabled = @"WCRefineMacMessageRepeatEnabled";
+static NSString *const kWCRDefaultsKeyCommentRepeatEnabled = @"WCRefineMacCommentRepeatEnabled";
 static NSString *const kWCRDefaultsKeyAvatarRoundEnabled = @"WCRefineMacAvatarRoundEnabled";
 static NSString *const kWCRDefaultsKeyGroupLeaveEnabled = @"WCRefineMacGroupLeaveEnabled";
 static NSString *const kWCRDefaultsKeyScreenCaptureBypassEnabled = @"WCRefineMacScreenCaptureBypassEnabled";
 static NSString *const kWCRDefaultsKeyAutoUpdateDisabled = @"WCRefineMacAutoUpdateDisabled";
 
 /// 菜单里展示的插件版本号；随功能变更手动递增。
-static NSString *const kWCRPluginVersion = @"1.0.0";
+static NSString *const kWCRPluginVersion = @"1.0.1";
 
 /// Menu items with a tag >= this value are rebuilt every time the submenu
 /// opens (original-ID rows and the option-key diagnostics entry).
@@ -92,6 +95,7 @@ static NSString *WCRRecallNotifyTargetLabel(void) {
 @property(nonatomic, strong) NSMenuItem *recallNotifyContactsPickerItem;
 @property(nonatomic, strong) NSMenuItem *voiceForwardItem;
 @property(nonatomic, strong) NSMenuItem *messageRepeatItem;
+@property(nonatomic, strong) NSMenuItem *commentRepeatItem;
 @property(nonatomic, strong) NSMenuItem *avatarToggleItem;
 @property(nonatomic, strong) NSMenu *avatarSubmenu;
 @property(nonatomic, strong) NSMenuItem *avatarParentItem;
@@ -128,6 +132,8 @@ static NSString *WCRRecallNotifyTargetLabel(void) {
 - (BOOL)syncVoiceForward:(NSError **)error;
 /// 消息复读跟随偏好安装长按菜单 Hook。关闭时卸掉，菜单立即恢复原生。
 - (BOOL)syncMessageRepeat:(NSError **)error;
+/// 朋友圈评论复读跟随偏好安装评论菜单 Hook。关闭时卸掉。
+- (BOOL)syncCommentRepeat:(NSError **)error;
 - (BOOL)currentProfileSupportsOriginalID;
 @end
 
@@ -164,6 +170,23 @@ static void WCRHideNativeMenuStateColumn(NSMenuItem *item) {
     item.mixedStateImage = blank;
 }
 
+/// macOS 14 起菜单默认把带 state 的项收成选择组。点一下之后系统会把
+/// item.state 写回打开前的值，自定义行若跟着 state 画，对号就像没点到。
+/// SelectAny 让每一行各自勾选，不再互相覆盖。
+static void WCRUseIndependentMenuChecks(NSMenu *menu) {
+    if (!menu) return;
+    if (@available(macOS 14.0, *)) {
+        if (menu.selectionMode != NSMenuSelectionModeSelectAny) {
+            menu.selectionMode = NSMenuSelectionModeSelectAny;
+        }
+    }
+    for (NSMenuItem *item in menu.itemArray) {
+        if (item.submenu && item.submenu != menu) {
+            WCRUseIndependentMenuChecks(item.submenu);
+        }
+    }
+}
+
 /// 行尾只留给子菜单箭头。对号跟在标题后面，不占最右一列。
 static CGFloat WCRMenuRowTrailingPad(NSMenuItem *item) {
     CGFloat trailing = kWCRMenuTrailingPad;
@@ -181,12 +204,18 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 @property(nonatomic, assign) BOOL hovered;
 @property(nonatomic, assign) BOOL interceptsClicks;
 @property(nonatomic, assign) BOOL dismissesMenu;
+@property(nonatomic, assign) BOOL checked;
+- (void)reflectItemState;
 - (instancetype)initWithMenuItem:(NSMenuItem *)item;
 - (instancetype)initWithMenuItem:(NSMenuItem *)item interceptsClicks:(BOOL)interceptsClicks;
 - (instancetype)initWithMenuItem:(NSMenuItem *)item
                 interceptsClicks:(BOOL)interceptsClicks
                    dismissesMenu:(BOOL)dismissesMenu;
 - (void)performMenuItemAction;
+- (void)performActionForItem:(NSMenuItem *)item;
+- (NSMenuItem *)mirroredToggleItem;
+- (BOOL)eventHitsChevron:(NSEvent *)event;
+- (void)openSubmenu;
 @end
 
 @implementation WCRPersistentMenuItemRow
@@ -213,8 +242,16 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
     _item = item;
     _interceptsClicks = interceptsClicks;
     _dismissesMenu = dismissesMenu;
+    // 对号不跟 item.state 走。macOS 14 之后菜单会把勾选态收成选择组，
+    // 自定义 view 自己改完 state，跟踪结束又写回开，看起来就像点了没反应。
+    _checked = item.state == NSControlStateValueOn;
     self.autoresizingMask = NSViewWidthSizable;
     return self;
+}
+
+- (void)reflectItemState {
+    self.checked = self.item.state == NSControlStateValueOn;
+    [self setNeedsDisplay:YES];
 }
 
 - (void)updateTrackingAreas {
@@ -254,7 +291,76 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
     [self setNeedsDisplay:YES];
 }
 
+- (NSMenuItem *)mirroredToggleItem {
+    NSMenuItem *item = self.item;
+    // 父行和子菜单里的同名开关不要共用 action。macOS 14 会把相同
+    // target/action 收成一组，点一次变成互斥选择，勾着就关不掉。
+    // setSubmenu: 会把父行 action 写成 submenuAction:。那只是标记，不是开关动作。
+    if (!item.submenu || (item.action && item.action != @selector(submenuAction:))) return nil;
+    for (NSMenuItem *child in item.submenu.itemArray) {
+        if (!child.action || child.submenu || child.action == @selector(submenuAction:)) continue;
+        if ([child.title isEqualToString:item.title]) return child;
+    }
+    return nil;
+}
+
+- (BOOL)eventHitsChevron:(NSEvent *)event {
+    NSMenuItem *item = self.item;
+    if (!item.submenu || !event) return NO;
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    if (!NSMouseInRect(point, self.bounds, self.isFlipped)) return NO;
+    return point.x >= NSWidth(self.bounds) - (kWCRMenuChevronPad + 6);
+}
+
+- (void)openSubmenu {
+    NSMenuItem *item = self.item;
+    NSMenu *submenu = item.submenu;
+    NSMenu *menu = item.menu;
+    if (!submenu || !menu) return;
+    // 不要发 submenuAction:。它只是 setSubmenu: 写下的标记，NSMenu 没有这个实现。
+    // 直接调用会 doesNotRecognizeSelector，微信把未捕获异常收成 abort。
+    Ivar extraIvar = class_getInstanceVariable([NSMenu class], "_extra");
+    id extra = extraIvar ? object_getIvar(menu, extraIvar) : nil;
+    Ivar implIvar = extra ? class_getInstanceVariable(object_getClass(extra), "_impl") : nil;
+    id impl = (extra && implIvar) ? object_getIvar(extra, implIvar) : nil;
+    NSView *viewer = self;
+    while (viewer && ![viewer respondsToSelector:@selector(menuItem)]) viewer = viewer.superview;
+    SEL openSel = NSSelectorFromString(@"_highlightMenuItemView:shouldOpenSubmenu:");
+    if (impl && viewer && [impl respondsToSelector:openSel]) {
+        @try {
+            ((void (*)(id, SEL, id, BOOL))objc_msgSend)(impl, openSel, viewer, YES);
+            return;
+        } @catch (NSException *exception) {
+            os_log_error(WCRLog(), "open submenu failed: %{public}@", exception);
+        }
+    }
+    NSPoint edge = [self convertPoint:NSMakePoint(NSMaxX(self.bounds), NSMaxY(self.bounds))
+                              toView:nil];
+    NSPoint screen = self.window ? [self.window convertPointToScreen:edge] : [NSEvent mouseLocation];
+    NSMenu *root = menu;
+    while (root.supermenu) root = root.supermenu;
+    [root cancelTracking];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [submenu popUpMenuPositioningItem:nil atLocation:screen inView:nil];
+    });
+}
+
 - (void)mouseDown:(NSEvent *)event {
+    NSMenuItem *item = self.item;
+    if (item && !item.enabled) return;
+    // 带勾的父行：点标题或对号就切换；点右侧箭头才展开格式和通知。
+    // 自定义 view 会挡住系统的子菜单展开，所以箭头要自己打开。
+    NSMenuItem *mirrored = [self mirroredToggleItem];
+    if (item.submenu && (mirrored == nil || [self eventHitsChevron:event])) {
+        [self openSubmenu];
+        return;
+    }
+    if (mirrored) {
+        [self performActionForItem:mirrored];
+        [self setNeedsDisplay:YES];
+        [self displayIfNeeded];
+        return;
+    }
     if (!self.interceptsClicks) {
         [super mouseDown:event];
         return;
@@ -265,10 +371,14 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)performMenuItemAction {
-    NSMenuItem *item = self.item;
-    if (!item.enabled || !item.action) return;
+    [self performActionForItem:self.item];
+}
+
+- (void)performActionForItem:(NSMenuItem *)item {
+    if (!item.enabled || !item.action || item.action == @selector(submenuAction:)) return;
     id target = item.target ?: [NSApp targetForAction:item.action to:nil from:item];
     SEL action = item.action;
+    if (![target respondsToSelector:action]) return;
     IMP implementation = [target methodForSelector:action];
     if (!implementation) return;
     void (^invoke)(void) = ^{
@@ -297,8 +407,11 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (NSString *)accessibilityRole {
-    if (!self.interceptsClicks || self.dismissesMenu) return NSAccessibilityMenuItemRole;
-    return NSAccessibilityCheckBoxRole;
+    // 纯开关才报成复选框。带子菜单的父行仍是菜单项（行身切换，箭头展开）。
+    if (self.interceptsClicks && !self.dismissesMenu && !self.item.submenu) {
+        return NSAccessibilityCheckBoxRole;
+    }
+    return NSAccessibilityMenuItemRole;
 }
 
 - (NSString *)accessibilityLabel {
@@ -306,11 +419,23 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (id)accessibilityValue {
-    return @(self.item.state == NSControlStateValueOn);
+    return @(self.checked);
 }
 
 - (BOOL)accessibilityPerformPress {
-    if (!self.item.enabled || !self.item.action) return NO;
+    NSMenuItem *item = self.item;
+    if (!item.enabled) return NO;
+    NSMenuItem *mirrored = [self mirroredToggleItem];
+    if (mirrored) {
+        [self performActionForItem:mirrored];
+        [self setNeedsDisplay:YES];
+        return YES;
+    }
+    if (item.submenu) {
+        [self openSubmenu];
+        return YES;
+    }
+    if (!item.action || item.action == @selector(submenuAction:)) return NO;
     [self performMenuItemAction];
     [self setNeedsDisplay:YES];
     return YES;
@@ -344,14 +469,15 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
     };
 
     CGFloat trailing = WCRMenuRowTrailingPad(item);
-    CGFloat afterTitle = (item.state == NSControlStateValueOn) ? WCRMenuRowAfterTitlePad() : 0;
+    BOOL on = self.checked;
+    CGFloat afterTitle = on ? WCRMenuRowAfterTitlePad() : 0;
     CGFloat titleMaxWidth = MAX(0, NSWidth(self.bounds) - kWCRMenuTitleMinX - trailing - afterTitle);
     CGFloat titleWidth = MIN(ceil([item.title sizeWithAttributes:attributes].width), titleMaxWidth);
     [item.title drawInRect:NSMakeRect(kWCRMenuTitleMinX, kWCRMenuContentY,
                                       titleWidth,
                                       kWCRMenuContentHeight)
             withAttributes:attributes];
-    if (item.state == NSControlStateValueOn) {
+    if (on) {
         NSMutableParagraphStyle *checkParagraph = [[NSMutableParagraphStyle alloc] init];
         checkParagraph.alignment = NSTextAlignmentCenter;
         NSDictionary<NSAttributedStringKey, id> *checkAttributes = @{
@@ -380,6 +506,15 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 @end
+
+/// 下一次开关看这一行自己画出来的勾，不看 item.state。
+/// 菜单跟踪结束后系统可能把 state 拨回去，再拿它决定开或关，点了就没反应。
+static BOOL WCRMenuItemChecked(NSMenuItem *item) {
+    if ([item.view isKindOfClass:[WCRPersistentMenuItemRow class]]) {
+        return ((WCRPersistentMenuItemRow *)item.view).checked;
+    }
+    return item.state == NSControlStateValueOn;
+}
 
 @implementation WCRMenuController
 
@@ -410,6 +545,11 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 
 - (BOOL)messageRepeatEnabled {
     id stored = [[NSUserDefaults standardUserDefaults] objectForKey:kWCRDefaultsKeyMessageRepeatEnabled];
+    return stored ? [stored boolValue] : NO;
+}
+
+- (BOOL)commentRepeatEnabled {
+    id stored = [[NSUserDefaults standardUserDefaults] objectForKey:kWCRDefaultsKeyCommentRepeatEnabled];
     return stored ? [stored boolValue] : NO;
 }
 
@@ -468,6 +608,10 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
     [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kWCRDefaultsKeyMessageRepeatEnabled];
 }
 
+- (void)setCommentRepeatEnabled:(BOOL)enabled {
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kWCRDefaultsKeyCommentRepeatEnabled];
+}
+
 - (void)setAvatarRoundEnabled:(BOOL)enabled {
     [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:kWCRDefaultsKeyAvatarRoundEnabled];
 }
@@ -502,6 +646,11 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 - (BOOL)currentProfileSupportsMessageRepeat {
     NSError *error = nil;
     return WCRMessageRepeatSupportsProfile(WCRCurrentProcessProfile(&error));
+}
+
+- (BOOL)currentProfileSupportsCommentRepeat {
+    NSError *error = nil;
+    return WCRCommentRepeatSupportsProfile(WCRCurrentProcessProfile(&error));
 }
 
 - (BOOL)currentProfileSupportsGroupLeave {
@@ -540,8 +689,12 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
     // 消息若只记到空正文，撤回时「撤回内容」这一行就会缺。
     BOOL tipNeedsCapture = [self antiRevokeEnabled] && [self recallTipEnabled] &&
                            profile && profile->revokeParserAddress != 0;
-    BOOL originalIDNeedsCapture = [self antiRevokeEnabled] && [self originalIDEnabled] &&
-                                  profile && WCRMessageCaptureSupportsProfile(profile);
+    // 有防撤回补丁点时，原始 ID 仍跟着防撤回开关。这一版没登记补丁点时，
+    // 原始 ID 和当前会话置顶只看自己的开关，避免关掉无效的防撤回把它们一起卸掉。
+    BOOL antiRevokeSite = profile && profile->patchAddress != 0;
+    BOOL originalIDNeedsCapture = [self originalIDEnabled] &&
+        (antiRevokeSite ? [self antiRevokeEnabled] : YES) &&
+        profile && WCRMessageCaptureSupportsProfile(profile);
     // 通知借用同一条收口拍文字外壳和原消息快照。正文捕获仍只跟撤回提示走。
     BOOL notifyWanted = ((([self antiRevokeEnabled] && WCRRecallNotifyWantsCapture()) ||
                           WCRRecallNotifyLeaveWantsCapture()) &&
@@ -668,6 +821,22 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
     return [self syncVoiceForward:error];
 }
 
+/// 朋友圈评论复读打开时安装评论菜单 Hook；关闭时恢复原生菜单。
+/// 启动早期 wechat.dylib 还没映射时保留偏好，由启动重试补装。
+- (BOOL)syncCommentRepeat:(NSError **)error {
+    if (![self commentRepeatEnabled]) {
+        return WCRCommentRepeatUninstall(error);
+    }
+    if (WCRCommentRepeatIsInstalled()) return YES;
+    NSError *profileError = nil;
+    const WCRPatchProfile *profile = WCRCurrentProcessProfile(&profileError);
+    if (!profile) {
+        if (error) *error = profileError;
+        return NO;
+    }
+    return WCRCommentRepeatInstall(profile, error);
+}
+
 - (WCRPatchState)currentState {
     if (WCRRecallTipIsInstalled()) return WCRPatchStateApplied;
     NSError *error = nil;
@@ -740,11 +909,14 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
     if (!item || item.isSeparatorItem) return;
     WCRHideNativeMenuStateColumn(item);
     if (item.view) return;
-    // 有自定义 view 的项，AppKit 不会发 action。hitTest 再返回 nil，点击就没人处理。
-    // 有动作的行拦截后先收菜单，再异步跑动作；带子菜单或没有动作的行继续放行。
+    // 有自定义 view 的项，AppKit 不会发 action，也不会自动展开子菜单。
+    // hitTest 再返回 nil 时，微信带搜索框的菜单点了没反应：带勾的父行关不掉。
+    // 命令行（有动作、无子菜单）拦截后先收菜单再异步执行。
+    // 子菜单行自己接点击：同名开关点行身切换，箭头或其余父行展开子菜单。
     BOOL command = item.action && !item.submenu;
+    BOOL handleClick = command || item.submenu != nil;
     item.view = [[WCRPersistentMenuItemRow alloc] initWithMenuItem:item
-                                                  interceptsClicks:command
+                                                  interceptsClicks:handleClick
                                                      dismissesMenu:command];
 }
 
@@ -760,7 +932,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
     if (!menu) return;
     for (NSMenuItem *item in menu.itemArray) {
         if ([item.view isKindOfClass:[WCRPersistentMenuItemRow class]]) {
-            [item.view setNeedsDisplay:YES];
+            [(WCRPersistentMenuItemRow *)item.view reflectItemState];
         }
         if (item.submenu) [self refreshAlignedRowsInMenu:item.submenu];
     }
@@ -989,6 +1161,9 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 
     self.messageRepeatItem = [self persistentMenuItemWithTitle:@"启用消息复读"
                                                         action:@selector(toggleMessageRepeat:)
+                                                          menu:submenu];
+    self.commentRepeatItem = [self persistentMenuItemWithTitle:@"启用朋友圈评论复读"
+                                                        action:@selector(toggleCommentRepeat:)
                                                           menu:submenu];
 
     // 圆角头像：二级菜单 = 开关 + 圆角大小预设（勾选当前档位）。
@@ -1306,7 +1481,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 #pragma mark - 退群监控
 
 - (void)toggleScreenCaptureBypass:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     [self setScreenCaptureBypassEnabled:enable];
     WCRScreenCaptureSetBypassEnabled(enable);
     [self refreshState];
@@ -1314,7 +1489,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)toggleAutoUpdate:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     [self setAutoUpdateDisabled:enable];
     WCRAutoUpdateSetEnabled(enable);
     [self refreshState];
@@ -1322,7 +1497,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)toggleGroupLeave:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     [self setGroupLeaveEnabled:enable];
     // 收口 Hook 由消息捕获模块独占，退群监控经观察者分发器复用；装/卸
     // 统一由 sync 裁决（撤回原文捕获/原始 ID 记录可能仍需要 Hook）。
@@ -1358,7 +1533,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)toggleGroupLeaveNotifySession:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     WCRRecallNotifySetLeaveSessionEnabled(enable);
     [self applyGroupLeaveNotifyChange:enable
                          failureTitle:@"无法开启退群通知"
@@ -1369,7 +1544,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)toggleGroupLeaveNotifySelf:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     WCRRecallNotifySetLeaveSelfEnabled(enable);
     [self applyGroupLeaveNotifyChange:enable
                          failureTitle:@"无法开启退群通知"
@@ -1413,6 +1588,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)refreshState {
+    WCRUseIndependentMenuChecks(self.antiRevokeParentItem.menu);
     BOOL enabled = [self antiRevokeEnabled];
     BOOL tipEnabled = [self recallTipEnabled];
     BOOL supportsTip = [self currentProfileSupportsRecallTip];
@@ -1423,7 +1599,13 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 
     NSString *statusLabel = nil;
     NSString *statusDetail = nil;
-    switch (state) {
+    const WCRPatchProfile *statusProfile = WCRCurrentProcessProfile(nil);
+    BOOL antiRevokeSite = statusProfile && statusProfile->patchAddress != 0;
+    if (statusProfile && !antiRevokeSite) {
+        // 构建已登记，但防撤回 cbz 对不上。不要报“字节不匹配”或“重试中”。
+        statusLabel = enabled ? @"异常" : @"正常";
+        statusDetail = @"防撤回未登记";
+    } else switch (state) {
         case WCRPatchStateApplied:
             // 防撤回（静默或带提示）已生效，插件工作正常。
             statusLabel = @"正常";
@@ -1451,9 +1633,13 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
             : nil;
     }
 
-    BOOL available = (state != WCRPatchStateUnavailable);
+    // 未登记防撤回时，开着的开关仍要能关掉；关掉之后置灰，避免再点开去写不存在的补丁。
+    // 完全没有版本配置时保持置灰。
+    BOOL available = !statusProfile ? NO
+        : (antiRevokeSite ? (state != WCRPatchStateUnavailable) : enabled);
     self.toggleItem.state = enabled ? NSControlStateValueOn : NSControlStateValueOff;
     self.toggleItem.enabled = available;
+    self.antiRevokeParentItem.enabled = available;
     self.tipItem.state = tipEnabled ? NSControlStateValueOn : NSControlStateValueOff;
     self.tipItem.enabled = supportsTip && enabled && available;
     self.contentItem.state = [self recallContentEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
@@ -1488,8 +1674,12 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
     BOOL supportsMessageRepeat = [self currentProfileSupportsMessageRepeat];
     self.messageRepeatItem.state = (supportsMessageRepeat && [self messageRepeatEnabled])
         ? NSControlStateValueOn : NSControlStateValueOff;
-    // 复读依赖 270135 的长按菜单收口和动作对象布局；未登记构建置灰。
+    // 复读依赖已登记构建的长按菜单收口和动作对象布局；未登记构建置灰。
     self.messageRepeatItem.enabled = supportsMessageRepeat;
+    BOOL supportsCommentRepeat = [self currentProfileSupportsCommentRepeat];
+    self.commentRepeatItem.state = (supportsCommentRepeat && [self commentRepeatEnabled])
+        ? NSControlStateValueOn : NSControlStateValueOff;
+    self.commentRepeatItem.enabled = supportsCommentRepeat;
     self.avatarToggleItem.state = [self avatarRoundEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
     // 容器行也要反映开关状态（用户期望：开启即打勾）。
     self.avatarParentItem.state = [self avatarRoundEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
@@ -1512,9 +1702,11 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
     // 退群监控复用消息捕获的收口 Hook，只在登记了收口几何信息的构建上可用
     // （与语音转发同一门控策略：没有登记就置灰，绝不猜测地址）。
     BOOL supportsGroupLeave = [self currentProfileSupportsGroupLeave];
-    self.groupLeaveItem.enabled = supportsGroupLeave;
+    BOOL groupLeaveOn = [self groupLeaveEnabled];
+    // 构建还不支持时，已经打开的开关仍要能关掉。置灰会把点击直接吃掉。
+    self.groupLeaveItem.enabled = supportsGroupLeave || groupLeaveOn;
     self.groupLeaveParentItem.state = self.groupLeaveItem.state;
-    self.groupLeaveParentItem.enabled = supportsGroupLeave;
+    self.groupLeaveParentItem.enabled = supportsGroupLeave || groupLeaveOn;
     self.groupLeaveTemplateItem.enabled = supportsGroupLeave;
     BOOL groupLeaveNotifyAvailable = [self groupLeaveEnabled] && supportsGroupLeave &&
                                      WCRRecallNotifySupportsProfile(notifyProfile);
@@ -1562,7 +1754,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)toggleAntiRevoke:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     NSError *error = nil;
     BOOL ok = NO;
     if (enable) {
@@ -1592,7 +1784,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)toggleRecallTip:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     [self setRecallTipEnabled:enable];
     NSError *error = nil;
     if ([self antiRevokeEnabled] && ![self applyConfiguredMode:&error]) {
@@ -1605,7 +1797,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)toggleRecallContent:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     // 提示文案在每次撤回到达时实时读取默认值，这里只需保存，无需重装补丁。
     [self setRecallContentEnabled:enable];
     [self refreshState];
@@ -1666,7 +1858,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)toggleRecallNotify:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     WCRRecallNotifySetMasterEnabled(enable);
     [self applyRecallNotifyChange:enable failureTitle:@"无法开启撤回消息通知" revert:^{
         WCRRecallNotifySetMasterEnabled(NO);
@@ -1675,7 +1867,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)toggleRecallNotifySelf:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     WCRRecallNotifySetSelfEnabled(enable);
     [self applyRecallNotifyChange:enable && WCRRecallNotifyMasterEnabled()
                      failureTitle:@"无法开启撤回消息通知"
@@ -1731,7 +1923,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)toggleRecallNotifySession:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     WCRRecallNotifySetSessionEnabled(enable);
     [self applyRecallNotifyChange:enable && WCRRecallNotifyMasterEnabled()
                      failureTitle:@"无法开启撤回消息通知"
@@ -1741,7 +1933,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)toggleNotifyContacts:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     WCRContactNameSetNotifyEnabled(enable);
     WCRConfigStoreBumpRevision();
     [self applyRecallNotifyChange:enable && WCRRecallNotifyMasterEnabled()
@@ -1769,7 +1961,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)toggleRecallNotifyForward:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     WCRRecallNotifySetForwardSelfEnabled(enable);
     [self applyRecallNotifyChange:enable && WCRRecallNotifyMasterEnabled()
                      failureTitle:@"无法开启撤回消息通知"
@@ -1815,7 +2007,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)toggleVoiceForward:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     [self setVoiceForwardEnabled:enable];
     NSError *error = nil;
     BOOL ok = [self syncVoiceForward:&error];
@@ -1836,7 +2028,7 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)toggleMessageRepeat:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     [self setMessageRepeatEnabled:enable];
     NSError *error = nil;
     BOOL ok = [self syncMessageRepeat:&error];
@@ -1857,8 +2049,29 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
     os_log_info(WCRLog(), "message repeat changed enabled=%{public}d", enable ? 1 : 0);
 }
 
+- (void)toggleCommentRepeat:(NSMenuItem *)sender {
+    BOOL enable = !WCRMenuItemChecked(sender);
+    [self setCommentRepeatEnabled:enable];
+    NSError *error = nil;
+    BOOL ok = [self syncCommentRepeat:&error];
+    if (!ok) {
+        NSString *message = error.localizedDescription ?: @"";
+        BOOL pending = [message containsString:@"尚未加载"];
+        if (enable && !pending) {
+            [self setCommentRepeatEnabled:NO];
+            [self syncCommentRepeat:nil];
+            [self showFailureTitle:@"无法开启朋友圈评论复读" error:error];
+        } else if (!enable) {
+            [self setCommentRepeatEnabled:YES];
+            [self showFailureTitle:@"无法关闭朋友圈评论复读" error:error];
+        }
+    }
+    [self refreshState];
+    os_log_info(WCRLog(), "comment repeat changed enabled=%{public}d", enable ? 1 : 0);
+}
+
 - (void)toggleAvatarRound:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     [self setAvatarRoundEnabled:enable];
     NSError *error = nil;
     BOOL ok = [self syncAvatarRound:&error];
@@ -1911,10 +2124,13 @@ static CGFloat WCRMenuRowAfterTitlePad(void) {
 }
 
 - (void)toggleOriginalID:(NSMenuItem *)sender {
-    BOOL enable = (sender.state != NSControlStateValueOn);
+    BOOL enable = !WCRMenuItemChecked(sender);
     [self setOriginalIDEnabled:enable];
     if (enable) [self setFloatingIDEnabled:YES];
-    if ([self antiRevokeEnabled]) {
+    const WCRPatchProfile *idProfile = WCRCurrentProcessProfile(nil);
+    BOOL syncCapture = [self antiRevokeEnabled];
+    if (idProfile && idProfile->patchAddress == 0) syncCapture = YES;
+    if (syncCapture) {
         NSError *error = nil;
         BOOL ok = [self syncMessageCapture:&error];
         if (!ok && enable) {
@@ -2068,12 +2284,17 @@ static BOOL WCRApplyStartupMode(NSError **error) {
     [gMenuController syncVoiceForward:nil];
     // 消息复读默认关闭；开启后安装长按菜单 Hook。失败不清偏好。
     [gMenuController syncMessageRepeat:nil];
+    // 朋友圈评论复读默认关闭；开启后安装评论菜单 Hook。失败不清偏好。
+    [gMenuController syncCommentRepeat:nil];
     // wechat.dylib 可能晚于插件加载；映射后再补开悬浮按钮。
     if ([gMenuController originalIDEnabled] && [gMenuController floatingIDEnabled] &&
         [gMenuController currentProfileSupportsOriginalID]) {
         WCRFloatingIDSetEnabled(YES);
     }
     if (![gMenuController antiRevokeEnabled]) return YES;
+    const WCRPatchProfile *startupProfile = WCRCurrentProcessProfile(nil);
+    // 补丁点未登记时重试也不会写上。留着偏好，等用户自己关掉。
+    if (startupProfile && startupProfile->patchAddress == 0) return YES;
     return [gMenuController applyConfiguredMode:error];
 }
 

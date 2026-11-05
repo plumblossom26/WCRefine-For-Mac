@@ -768,7 +768,7 @@ static void WCRPinFullWidth(NSView *view, NSView *container) {
                                         weight:NSFontWeightBold
                                          color:[NSColor labelColor]
                                      alignment:NSTextAlignmentCenter];
-    NSTextField *subtitleField = [self guideText:@"基于微信 macOS 4.1.15.55（270135）制作。\n复制一份微信并载入插件，原来的微信不会被修改。"
+    NSTextField *subtitleField = [self guideText:@"基于微信 macOS 4.1.15.55（270135）和 4.2.0.15（270351）制作。\n复制一份微信并载入插件，原来的微信不会被修改。"
                                              size:13
                                            weight:NSFontWeightRegular
                                             color:[NSColor secondaryLabelColor]
@@ -968,10 +968,12 @@ static void WCRPinFullWidth(NSView *view, NSView *container) {
 
     self.statusField.textColor = [NSColor systemGreenColor];
     self.statusField.stringValue = [NSString stringWithFormat:
-        @"已识别微信 %@（%@），补丁点%@。",
+        @"已识别微信 %@（%@），%@。",
         inspection.shortVersion ?: @"?",
         inspection.buildVersion ?: @"?",
-        inspection.alreadyPatched ? @"已处于补丁状态" : @"校验通过"];
+        inspection.profile.patchAddress == 0
+            ? @"已登记的入口校验通过，防撤回补丁点未登记"
+            : (inspection.alreadyPatched ? @"补丁点已处于补丁状态" : @"补丁点校验通过")];
     [self refreshOutputState];
 }
 
